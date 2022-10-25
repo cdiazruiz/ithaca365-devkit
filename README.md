@@ -17,7 +17,7 @@ The devkit is tested for Python 3.6, Python 3.7 and Python 3.8.
 
 Our devkit is available and can be installed via [pip](https://pip.pypa.io/en/stable/installing/) :
 ```
-pip install git+https://github.com/cxy1997/ithaca365-devkit.git
+pip install git+https://github.com/cdiazruiz/ithaca365-devkit.git
 ```
 
 ## Ithaca365
