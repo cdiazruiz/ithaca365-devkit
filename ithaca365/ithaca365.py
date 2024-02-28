@@ -31,6 +31,7 @@ from ithaca365.utils.data_io import load_bin_file, panoptic_to_lidarseg, load_ve
 from ithaca365.utils.geometry_utils import view_points, box_in_image, BoxVisibility, transform_matrix, transform_points
 from ithaca365.utils.color_map import get_colormap
 from ithaca365.utils.ithimages import annotation_name, mask_decode, get_font, name_to_index_mapping
+from ithaca365.utils.ithrectify import apply_rectify
 
 PYTHON_VERSION = sys.version_info[0]
 
@@ -61,14 +62,12 @@ class Ithaca365(object):
         self.table_names = ['category', 'attribute', 'visibility', 'instance', 'sensor', 'calibrated_sensor',
                             'ego_pose', 'log', 'scene', 'sample', 'sample_data', 'sample_annotation', 'map',
                             'location', 'weather', 'object_ann']
-                            # 'location', 'weather']
 
         assert osp.isdir(self.table_root), 'Database version not found: {}'.format(self.table_root)
 
         start_time = time.time()
         if verbose:
             print("======\nLoading Ithaca365 tables for version {}...".format(self.version))
-
         # Explicitly assign tables to help the IDE determine valid class members.
         self.category = self.__load_table__('category')
         self.attribute = self.__load_table__('attribute')
@@ -84,7 +83,7 @@ class Ithaca365(object):
         self.sample_annotation = self.__load_table__('sample_annotation')
         self.map = self.__load_table__('map')
         self.location = self.__load_table__('locations')
-        self.weather = self.__load_table__('weather')
+        # self.weather = self.__load_table__('weather')
         self.ignored_history = ignored_history
 
         # Initialize the colormap which maps from class names to RGB values.
@@ -196,6 +195,18 @@ class Ithaca365(object):
         mask = ~((np.abs(points[:, 0]) < center_radius) & (np.abs(points[:, 1]) < center_radius))
         return points[mask]
     
+    def get_rectification_params(self):
+        class CameraParams(object):
+            def __init__(self, data):
+                self.data = data
+
+        for sensor in self.calibrated_sensor:
+                sensor_token = sensor['sensor_token']
+                sensor_record = self.get('sensor', sensor_token)
+                if sensor_record['channel'] in ['cam0','cam1','cam2','cam3']:
+                    name =  sensor_record['channel']
+                    c_params = CameraParams(sensor)
+                    setattr(self, name, c_params)
 
     def get_lidar_within_range(self, sample_data_token, ranges=(0, 70), every_x_meter=5.):
         """
@@ -933,7 +944,8 @@ class Ithaca365(object):
                                    show_lidarseg_legend: bool = False,
                                    verbose: bool = True,
                                    lidarseg_preds_bin_path: str = None,
-                                   show_panoptic: bool = False) -> None:
+                                   show_panoptic: bool = False,
+                                   rectify: bool = False) -> None:
         self.explorer.render_pointcloud_in_image(sample_token, dot_size, pointsensor_channel=pointsensor_channel,
                                                  camera_channel=camera_channel, out_path=out_path,
                                                  render_intensity=render_intensity,
@@ -942,7 +954,8 @@ class Ithaca365(object):
                                                  show_lidarseg_legend=show_lidarseg_legend,
                                                  verbose=verbose,
                                                  lidarseg_preds_bin_path=lidarseg_preds_bin_path,
-                                                 show_panoptic=show_panoptic)
+                                                 show_panoptic=show_panoptic,
+                                                 rectify= rectify)
 
     def render_sample(self, sample_token: str,
                       box_vis_level: BoxVisibility = BoxVisibility.ANY,
@@ -1341,7 +1354,8 @@ class NuScenesExplorer:
                                 show_lidarseg: bool = False,
                                 filter_lidarseg_labels: List = None,
                                 lidarseg_preds_bin_path: str = None,
-                                show_panoptic: bool = False) -> Tuple:
+                                show_panoptic: bool = False,
+                                rectify: bool = False) -> Tuple:
         """
         Given a point sensor (lidar/radar) token and camera sample_data token, load pointcloud and map it to the image
         plane.
@@ -1378,9 +1392,9 @@ class NuScenesExplorer:
             pc = LidarPointCloud.from_file(pcl_path)
         else:
             pc = RadarPointCloud.from_file(pcl_path)
-        print(pc.points.shape)
+        # print(pc.points.shape)
         im = Image.open(osp.join(self.nusc.dataroot, cam['filename']))
-
+        
         # Points live in the point sensor frame. So they need to be transformed via global to the image plane.
         # First step: transform the pointcloud to the ego vehicle frame for the timestamp of the sweep.
         cs_record = self.nusc.get('calibrated_sensor', pointsensor['calibrated_sensor_token'])
@@ -1399,9 +1413,22 @@ class NuScenesExplorer:
 
         # Fourth step: transform from ego into the camera.
         cs_record = self.nusc.get('calibrated_sensor', cam['calibrated_sensor_token'])
-        pc.translate(-np.array(cs_record['translation']))
-        pc.rotate(Quaternion(cs_record['rotation']).rotation_matrix.T)
-
+        if rectify:
+            pc.translate(-np.array(cs_record['translation_rect']))
+            pc.rotate(Quaternion(cs_record['rotation_rect']).rotation_matrix.T)
+            intrinsic = np.array(cs_record['camera_intrinsic']).reshape((3,3))
+            distCoeff = np.array(cs_record['dist_coeff']).reshape(1,5)
+            R = np.array(cs_record['rectification_r']).reshape((3,3))
+            P = np.array(cs_record['rectification_p']).reshape((3,4))
+            print(im.size)
+            width, height = im.size
+            im = np.array(im)
+            im = apply_rectify(intrinsic, distCoeff, R, P, (width,height), im)
+            im = Image.fromarray(im)
+        else:
+            pc.translate(-np.array(cs_record['translation']))
+            pc.rotate(Quaternion(cs_record['rotation']).rotation_matrix.T)
+        
         # Fifth step: actually take a "picture" of the point cloud.
         # Grab the depths (camera frame z axis points away from the camera).
         depths = pc.points[2, :]
@@ -1458,7 +1485,10 @@ class NuScenesExplorer:
             coloring = depths
 
         # Take the actual picture (matrix multiplication with camera-matrix + renormalization).
-        points = view_points(pc.points[:3, :], np.array(cs_record['camera_intrinsic']), normalize=True)
+        if rectify:
+            points = view_points(pc.points[:3, :], np.array(cs_record['camera_matrix_rect']), normalize=True)
+        else:
+            points = view_points(pc.points[:3, :], np.array(cs_record['camera_intrinsic']), normalize=True)
 
         # Remove points that are either outside or behind the camera. Leave a margin of 1 pixel for aesthetic reasons.
         # Also make sure points are at least 1m in front of the camera to avoid seeing the lidar points on the camera
@@ -1487,7 +1517,8 @@ class NuScenesExplorer:
                                    show_lidarseg_legend: bool = False,
                                    verbose: bool = True,
                                    lidarseg_preds_bin_path: str = None,
-                                   show_panoptic: bool = False):
+                                   show_panoptic: bool = False,
+                                   rectify: bool = False):
         """
         # TODO: CHANGE CAMERA NAMING
         Scatter-plots a pointcloud on top of image.
@@ -1521,7 +1552,8 @@ class NuScenesExplorer:
                                                             show_lidarseg=show_lidarseg,
                                                             filter_lidarseg_labels=filter_lidarseg_labels,
                                                             lidarseg_preds_bin_path=lidarseg_preds_bin_path,
-                                                            show_panoptic=show_panoptic)
+                                                            show_panoptic=show_panoptic,
+                                                            rectify = rectify)
 
         # Init axes.
         if ax is None:
